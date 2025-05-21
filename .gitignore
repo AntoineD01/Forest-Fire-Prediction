@@ -1,0 +1,21 @@
+# Ignore the folder containing fire images
+fire_images/
+
+# Ignore the generated CSV that includes your name or personal data
+df_nature_with_images.csv
+
+# Ignore other CSVs with personal data (optional, be specific if needed)
+incendies_meteo_safe.csv
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.ipynb_checkpoints/
+
+# Environment files
+.env
+*.env
+
+# OS-specific files
+.DS_Store
+Thumbs.db
