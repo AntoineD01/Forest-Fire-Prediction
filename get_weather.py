@@ -1,75 +1,113 @@
 import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_squared_error, r2_score
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-import matplotlib.pyplot as plt
-import seaborn as sns
+import csv
+import os
+import time
+from datetime import datetime, timedelta
+from geopy.geocoders import Nominatim
+from meteostat import Point, Hourly
 
-# --- 1. Chargement des données ---
-df = pd.read_csv("incendies_meteo_safe.csv", delimiter=';')
+# --- Configuration ---
+INPUT_FILE = "Incendies.csv"
+OUTPUT_FILE = "incendies_meteo_safe.csv"
+geolocator = Nominatim(user_agent="weather_matcher")
 
-# --- 2. Colonnes utilisées pour prédire la surface brûlée ---
-features = [
-    'temp', 'humidity', 'pressure', 'wind_speed', 'wind_deg', 'rain_1h',
-    'Surface forêt (m2)', 'Surface maquis garrigues (m2)',
-    'Autres surfaces naturelles hors forêt (m2)', 'Surfaces agricoles (m2)',
-    'Surface autres terres boisées (m2)', 'Surfaces non boisées (m2)',
-    'Nature'  # variable catégorielle
-]
+# --- Meteostat requires UTC timestamps ---
+def get_weather_data(lat, lon, timestamp):
+    try:
+        location = Point(lat, lon)
+        start = timestamp.replace(minute=0, second=0, microsecond=0)
+        end = start + timedelta(hours=6)
 
-target = 'Surface parcourue (m2)'
+        data = Hourly(location, start, end)
+        data = data.fetch()
 
-for col in ['temp', 'humidity', 'pressure', 'wind_speed', 'Surface parcourue (m2)']:
-    median_val = df[col].median()
-    df[col].fillna(median_val, inplace=True)
+        if not data.empty:
+            first = data.iloc[0]
+            return {
+                "temp": first.get("temp", None),
+                "humidity": first.get("rhum", None),
+                "pressure": first.get("pres", None),
+                "wind_speed": first.get("wspd", None),
+                "wind_deg": first.get("wdir", None),
+                "clouds": first.get("cldc", None),
+                "rain_1h": first.get("prcp", None),
+                "weather": None  # Meteostat doesn't give weather description
+            }
+    except Exception as e:
+        print(f"[WeatherError] {e}")
 
-df['Nature'].fillna('Inconnue', inplace=True)
+    return {
+        "temp": None, "humidity": None, "pressure": None,
+        "wind_speed": None, "wind_deg": None, "clouds": None,
+        "rain_1h": None, "weather": None
+    }
 
-print(f"Lignes après imputation : {len(df)}")
+# --- Geocoding INSEE code to lat/lon ---
+def get_lat_lon(code_insee):
+    try:
+        location = geolocator.geocode(f"France {code_insee}", timeout=10)
+        if location:
+            return location.latitude, location.longitude
+    except Exception as e:
+        print(f"[GeoError] INSEE {code_insee}: {e}")
+    return None, None
 
+# --- Resume: Read already processed rows ---
+processed_keys = set()
+if os.path.exists(OUTPUT_FILE):
+    with open(OUTPUT_FILE, encoding='utf-8') as f:
+        reader = csv.DictReader(f, delimiter=';')
+        for row in reader:
+            key = row['Code INSEE'] + row['Date de première alerte']
+            processed_keys.add(key)
 
+# --- Main processing ---
+with open(INPUT_FILE, encoding='utf-8') as infile, open(OUTPUT_FILE, mode='a', encoding='utf-8', newline='', buffering=1) as outfile:
+    reader = csv.DictReader(infile, delimiter=';')
+    
+    # Prepare writer
+    fieldnames = reader.fieldnames + ["latitude", "longitude", "temp", "humidity", "pressure",
+                                      "wind_speed", "wind_deg", "clouds", "rain_1h", "weather"]
+    writer = csv.DictWriter(outfile, fieldnames=fieldnames, delimiter=';')
 
-# --- 3. Séparation X / y ---
-X = df[features]
-y = df[target]
+    # Write header if file is empty
+    if os.stat(OUTPUT_FILE).st_size == 0:
+        writer.writeheader()
+        outfile.flush()
 
-# --- 4. Pipeline d'encodage + modèle ---
-categorical = ['Nature']
-numerical = list(set(features) - set(categorical))
+    for i, row in enumerate(reader, start=1):
+        try:
+            key = row['Code INSEE'] + row['Date de première alerte']
+            if key in processed_keys:
+                print(f"[{i}] Skipping: Already processed INSEE {row['Code INSEE']}")
+                continue
 
-preprocessor = ColumnTransformer(
-    transformers=[
-        ('num', 'passthrough', numerical),
-        ('cat', OneHotEncoder(handle_unknown='ignore'), categorical)
-    ]
-)
+            # Date parsing
+            alert_date = pd.to_datetime(row["Date de première alerte"], errors='coerce')
+            if pd.isnull(alert_date):
+                print(f"[Warning] Invalid date on line {i}")
+                alert_date = datetime.utcnow()
 
-model = Pipeline(steps=[
-    ('preprocessor', preprocessor),
-    ('regressor', LinearRegression())
-])
+            # Geolocation
+            lat, lon = get_lat_lon(row["Code INSEE"])
+            row["latitude"] = lat
+            row["longitude"] = lon
 
-# --- 5. Split & entraînement ---
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-model.fit(X_train, y_train)
+            # Weather
+            if lat is not None and lon is not None:
+                weather = get_weather_data(lat, lon, alert_date)
+            else:
+                weather = {key: None for key in ["temp", "humidity", "pressure", "wind_speed", "wind_deg", "clouds", "rain_1h", "weather"]}
 
-# --- 6. Prédictions et évaluation ---
-y_pred = model.predict(X_test)
+            row.update(weather)
 
-print("✅ Régression linéaire entraînée")
-print(f"RMSE: {np.sqrt(mean_squared_error(y_test, y_pred)):.2f}")
-print(f"R²: {r2_score(y_test, y_pred):.3f}")
+            # Write line
+            writer.writerow(row)
+            outfile.flush()
 
-# --- 7. Résidus ---
-plt.figure(figsize=(8, 6))
-sns.scatterplot(x=y_test, y=y_pred, alpha=0.3)
-plt.xlabel("Surface réelle (m2)")
-plt.ylabel("Surface prédite (m2)")
-plt.title("Surface brûlée réelle vs prédite")
-plt.plot([0, y.max()], [0, y.max()], color='red', linestyle='--')
-plt.tight_layout()
-plt.show()
+            print(f"[{i}] Saved: INSEE {row['Code INSEE']}")
+            time.sleep(1)
+
+        except Exception as e:
+            print(f"[Error] Line {i}: {e}")
+            continue
